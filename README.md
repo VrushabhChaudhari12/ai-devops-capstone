@@ -1,156 +1,174 @@
-# AI DevOps Operations Platform - Capstone Project
+# AI DevOps Operations Platform — Capstone Project
 
-An End-to-End AI DevOps Operations Platform with a multi-agent system where a Lead Orchestrator receives CloudWatch alarms and delegates to specialist sub-agents.
+> **End-to-end multi-agent AIOps platform** — a Lead Orchestrator receives CloudWatch alarms and coordinates three specialist LLM sub-agents (LogAnalyst, MetricsAnalyst, RemediationPlanner) to autonomously investigate incidents and generate Slack-ready remediation reports in under 5 minutes.
 
-## Overview
+---
 
-This project implements a sophisticated multi-agent AI system for automated incident investigation and remediation planning. The system uses a Lead Orchestrator that receives CloudWatch alarms and delegates to three specialized sub-agents in sequence.
+## Problem
+
+When a CloudWatch alarm fires, the on-call engineer manually pulls logs, checks metrics dashboards, identifies root cause, and writes a remediation plan — a process that takes 45–90 minutes and requires deep system knowledge. Nights and weekends make this worse.
+
+## Solution
+
+A **multi-agent AI system** that mirrors the mental model of a senior SRE: one orchestrator receives the alarm context and dispatches specialist agents in sequence. Each agent has full termination safety (retries, timeout, loop detection) so the system never hangs. The result is a comprehensive Slack investigation report in under 5 minutes.
+
+---
 
 ## Architecture
 
 ```
-Lead Orchestrator
-    │
-    ├──► LogAnalyst (analyzes logs)
-    │
-    ├──► MetricsAnalyst (analyzes metrics)
-    │
-    └──► RemediationPlanner (creates remediation plan)
-              │
-              ▼
-        Final Slack Report
+CloudWatch Alarm (JSON)
+        │
+        ▼
+  orchestrator.py          ← Lead Orchestrator
+  (coordinates all agents)   ─ total timeout: 300s
+        │
+        ├── 1. LogAnalyst        ← Reads CloudWatch logs — identifies errors, patterns
+        │        └─► LOG_ANALYSIS_COMPLETE
+        │
+        ├── 2. MetricsAnalyst    ← Reads metric baselines, trends, anomaly type
+        │        └─► METRICS_ANALYSIS_COMPLETE
+        │
+        └── 3. RemediationPlanner ← Synthesizes findings → severity + fix plan
+                 └─► REMEDIATION_PLAN_COMPLETE
+                        │
+                        ▼
+               slack_reporter.py    ← Formats + posts final Slack report
 ```
+
+---
 
 ## Sub-Agents
 
-1. **LogAnalyst**: Analyzes CloudWatch and application logs to identify errors and patterns
-2. **MetricsAnalyst**: Analyzes metric baselines, trends, and anomaly types
-3. **RemediationPlanner**: Creates remediation plans with severity, root cause, and fix recommendations
+| Agent | Responsibility | Termination Signal |
+|---|---|---|
+| **LogAnalyst** | Scans CloudWatch logs for error patterns, first-occurrence timestamps, error frequency | `LOG_ANALYSIS_COMPLETE` |
+| **MetricsAnalyst** | Compares current metric vs baseline, identifies trend (spiking/dropping/steady), anomaly type | `METRICS_ANALYSIS_COMPLETE` |
+| **RemediationPlanner** | Synthesizes log + metric findings into a severity-rated remediation plan with immediate + long-term actions | `REMEDIATION_PLAN_COMPLETE` |
 
-## Key Features
+---
 
-- **Multi-Agent Coordination**: Lead Orchestrator manages three sub-agents
-- **Four-Layer Termination Safety on EVERY agent**:
-  1. Named termination condition (e.g., "LOG_ANALYSIS_COMPLETE")
-  2. MAX_RETRIES=3 with exponential backoff
-  3. TIMEOUT_SECONDS=60 per sub-agent
-  4. Loop detection (tracks last 3 responses)
-- **Total Orchestrator Timeout**: 300 seconds (5 minutes) wall clock
-- **Graceful Degradation**: Returns partial results with WARNING flag if any sub-agent fails
-- **Token Budget**: max_tokens=400 per LLM call
+## Four-Layer Termination Safety (Per Agent)
 
-## Supported Alarm Scenarios
+Every sub-agent implements independent, non-blocking safety:
 
-1. **CPU Spike Alarm**: EC2 CPU utilization exceeding threshold
-2. **RDS Connection Alarm**: Database connections at maximum
-3. **Pipeline Failure Alarm**: CodePipeline build failure
+| Layer | Mechanism | Value |
+|---|---|---|
+| **1. Named termination** | Agent must echo a specific completion string | Agent-specific signal |
+| **2. Max retries** | Hard ceiling on retry attempts | 3 retries |
+| **3. Per-agent timeout** | Wall-clock limit per LLM call | 60 seconds |
+| **4. Loop detection** | Detects repeated identical outputs | Last 3 responses |
 
-## Stack
+**Orchestrator total timeout**: 300 seconds (5 minutes) for entire investigation.
 
-- **Language**: Python 3.10+
-- **LLM**: Ollama (localhost:11434) with llama3.2 model
-- **Dependencies**: openai
+**Graceful degradation**: if any sub-agent fails, investigation continues with remaining agents and final report includes a `WARNING` banner for affected sections.
 
-## Installation
+---
 
-1. Install the required Python packages:
+## Alarm Scenarios
+
+| Scenario | Trigger | Sub-agents Involved |
+|---|---|---|
+| `cpu_spike` | EC2 CPUUtilization > 85% for 5 min | All 3 |
+| `rds_connections` | DB connections at max pool limit | All 3 |
+| `pipeline_failure` | CodePipeline execution failed | LogAnalyst + RemediationPlanner |
+
+---
+
+## Sample Slack Report Output
+
+```
+======================================================================
+              SLACK INVESTIGATION REPORT
+======================================================================
+
+INCIDENT SUMMARY
+----------------------------------------------------------------------
+  Alarm Name  : HighCPU - production-api (i-0abc123)
+  Status      : COMPLETE
+  Duration    : 45.2s
+  Agents done : LogAnalyst, MetricsAnalyst, RemediationPlanner
+
+LOG ANALYSIS
+----------------------------------------------------------------------
+  Log Source  : /aws/ec2/production-api
+  Errors      : 3  |  First seen: 2026-04-14T10:25:00Z
+  Pattern     : Connection pool exhaustion - "too many clients"
+
+METRICS ANALYSIS
+----------------------------------------------------------------------
+  Metric      : CPUUtilization
+  Current     : 96%  |  Baseline: 45%  |  Trend: spiking
+  Anomaly     : sudden - correlated with deploy at 10:22Z
+
+REMEDIATION PLAN
+----------------------------------------------------------------------
+  Severity        : HIGH
+  Root Cause      : Application not releasing DB connections after deploy
+  Immediate       : Restart application servers + scale out ASG by 2
+  Long-term       : Fix connection pool leak in auth-service v2.3
+  Safe to automate: PARTIAL - requires monitoring after restart
+======================================================================
+```
+
+---
+
+## Tech Stack
+
+- **Language**: Python 3.11+
+- **LLM runtime**: Ollama (`llama3.2`) — fully local, no external API
+- **LLM client**: `openai` SDK (OpenAI-compatible endpoint)
+- **Alerting**: Slack Incoming Webhooks
+- **Config**: `config.py` + environment variables
+
+---
+
+## Setup & Run
 
 ```bash
+# 1. Start Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+ollama run llama3.2
+
+# 2. Install dependencies
 pip install -r requirements.txt
+
+# 3. Run all alarm scenarios
+python main.py
+
+# Optional env vars
+export BASE_URL=http://localhost:11434/v1
+export MODEL=llama3.2
+export SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+export LOG_LEVEL=INFO
 ```
 
-2. Ensure Ollama is running with the llama3.2 model:
+---
 
-```bash
-ollama serve
-# In another terminal:
-ollama pull llama3.2
-```
+## Why This Matters (Resume Context)
 
-## Usage
+This is the capstone project — it pulls together every pattern from the portfolio:
+- **Multi-agent orchestration** with real termination safety → production-ready agentic design
+- **AIOps at scale**: handles CPU, DB, and pipeline incidents in a single platform
+- Demonstrates **SRE thinking**: MTTR reduction, graceful degradation, partial-result tolerance
+- Local LLM → incident data stays in VPC, enterprise-compliant
+- Directly analogous to: AWS Systems Manager Automation, PagerDuty Event Intelligence, Datadog Watchdog
 
-Run the platform for all three alarm scenarios:
+---
 
-```bash
-py main.py
-```
-
-This will:
-1. Process each CloudWatch alarm scenario
-2. Run the Lead Orchestrator to coordinate investigation
-3. Execute all three sub-agents in sequence
-4. Generate a final Slack-style report
-
-## Output Format
-
-The platform generates a comprehensive Slack report with these sections:
-
-- **INCIDENT SUMMARY**: Alarm name, status, total investigation time
-- **LOG ANALYSIS**: Log source, errors found, error patterns
-- **METRICS ANALYSIS**: Metric name, current value, baseline, trend
-- **REMEDIATION PLAN**: Severity, root cause, immediate action, long-term fix
-
-## Termination Rules
-
-Each sub-agent implements these termination layers:
-
-| Layer | Description | Value |
-|-------|-------------|-------|
-| Termination Condition | Named string in response | Agent-specific |
-| Max Retries | Hard ceiling on retries | 3 |
-| Timeout | Wall clock limit | 60 seconds |
-| Loop Detection | Track repeated outputs | Last 3 responses |
-
-The Lead Orchestrator has a total timeout of 300 seconds (5 minutes) for the entire investigation.
-
-## Error Handling
-
-If any sub-agent hits MAX_RETRIES or TIMEOUT:
-- Returns a partial result with WARNING flag
-- Investigation continues with remaining sub-agents
-- Final report includes WARNING banner for affected sub-agents
-- Never hangs or blocks indefinitely
-
-## Example Output
+## Project Structure
 
 ```
-======================================================================
-                    SLACK INVESTIGATION REPORT
-======================================================================
-
-📋 *INCIDENT SUMMARY*
-----------------------------------------------------------------------
-*Alarm Name:* HighCPU utilization on production instance
-*Status:* COMPLETE
-*Total Investigation Time:* 45.2s
-*Sub-agents Completed:* LogAnalyst, MetricsAnalyst, RemediationPlanner
-
-📊 *LOG ANALYSIS*
-----------------------------------------------------------------------
-*Log Source:* CloudWatch Logs
-*Errors Found:* 3
-*First Error Time:* 2024-03-15T14:25:00Z
-*Error Pattern:* Connection pool exhaustion
-
-📈 *METRICS ANALYSIS*
-----------------------------------------------------------------------
-*Metric Name:* CPUUtilization
-*Current Value:* 96
-*Baseline:* 45
-*Trend:* spiking
-*Anomaly Type:* sudden
-
-🔧 *REMEDIATION PLAN*
-----------------------------------------------------------------------
-*Severity:* high
-*Root Cause:* Application not releasing connections properly
-*Immediate Action:* Scale up EC2 instances
-*Long-term Fix:* Fix connection pool leak in application code
-*Safe to Automate:* partial - requires monitoring
-
-======================================================================
+ai-devops-capstone/
+├── config.py           # Centralized config (env vars, defaults)
+├── main.py             # CLI entrypoint: runs all alarm scenarios
+├── orchestrator.py     # Lead Orchestrator: coordinates sub-agents, enforces timeouts
+├── sub_agents.py       # LogAnalyst, MetricsAnalyst, RemediationPlanner agents
+├── mock_data.py        # Simulated CloudWatch alarm + log + metric scenarios
+├── slack_reporter.py   # Formats and posts final Slack investigation report
+└── requirements.txt
 ```
 
-## License
+---
 
-MIT
+*MIT License*
